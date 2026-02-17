@@ -1,43 +1,46 @@
 #include <opencv2/opencv.hpp>
-#include <opencv2/video.hpp> 
+#include <opencv2/cudaarithm.hpp>
+#include <opencv2/cudabgsegm.hpp>
+#include <opencv2/cudafilters.hpp>
+#include <opencv2/cudaimgproc.hpp>
+
 #include <iostream>
 #include <fstream>
 #include <deque>
 #include <map>
 #include <cmath>
-#include <filesystem>
-#include <fstream>
 #include <chrono>
 
 using namespace cv;
 using namespace std;
 
 // ---------------- Parameters ----------------
-const string VIDEO_PATH = "C:\\Users\\kasat\\Downloads\\7652_Sunset_Sundown_1920x1080.mp4";
-const string OUT_PATH = "C:\\Users\\kasat\\Desktop\\dip_vlom\\output_annotated1.mp4";
-const string OUT_CSV = "C:\\Users\\kasat\\Desktop\\dip_vlom\\detections1.csv";
+const string VIDEO_PATH = "./video.mp4";
+const string OUT_PATH = "./output_cuda.mp4";
+const string OUT_CSV = "./detections_cuda.csv";
 
-const double UPSCALE = 1.0;
 const int MOG_HISTORY = 30;
-const double MOG_VAR_THRESHOLD = 16;
+const double MOG_VAR_THRESHOLD = 25;
 const bool MOG_DETECT_SHADOWS = false;
 
-const double MIN_AREA = 10;
+const double MIN_AREA = 200;
 const double MAX_AREA = 2000;
 const int N_CONFIRM = 10;
 const int MAX_MISSES = 6;
 const double DIST_THRESH = 60.0;
 
-// Morphology kernels
-Mat KERNEL_OPEN = getStructuringElement(MORPH_ELLIPSE, Size(3, 3));
-Mat KERNEL_CLOSE = getStructuringElement(MORPH_ELLIPSE, Size(7, 7));
+const double UPSCALE = 4.0;
+
+// Morphology kernels (CPU создаём, CUDA использует их внутри фильтра)
+Mat KERNEL_OPEN = getStructuringElement(MORPH_ELLIPSE, Size(5, 5));
+Mat KERNEL_CLOSE = getStructuringElement(MORPH_ELLIPSE, Size(9, 9));
 
 // Colors
 Scalar COLOR_PENDING(0, 255, 255);
 Scalar COLOR_CONFIRMED(0, 0, 255);
 Scalar COLOR_TRACK(255, 0, 0);
 
-// ---------------- Minimal centroid tracker ----------------
+// ---------------- Tracker ----------------
 struct Track {
     int id;
     Point2f centroid;
@@ -47,183 +50,191 @@ struct Track {
     deque<Point2f> history;
     bool confirmed;
 
-    Track() : id(0), centroid(0, 0), bbox(0, 0, 0, 0), hits(0), misses(0), confirmed(false) {}
-    Track(int tid, Point2f c, Rect b) : id(tid), centroid(c), bbox(b), hits(1), misses(0), confirmed(false) {
+    Track() {}
+    Track(int tid, Point2f c, Rect b)
+        : id(tid), centroid(c), bbox(b),
+        hits(1), misses(0), confirmed(false)
+    {
         history.push_back(c);
     }
 };
 
 class SimpleTracker {
 private:
-    int next_id;
+    int next_id = 1;
     map<int, Track> tracks;
-    double dist_threshold;
-    int max_misses;
-    int confirm_hits;
 
     double dist(Point2f a, Point2f b) {
         return hypot(a.x - b.x, a.y - b.y);
     }
 
 public:
-    SimpleTracker(double dt = DIST_THRESH, int mm = MAX_MISSES, int ch = N_CONFIRM)
-        : next_id(1), dist_threshold(dt), max_misses(mm), confirm_hits(ch) {
-    }
-
     void update(vector<pair<Point2f, Rect>>& detections) {
+
         set<int> assigned;
-        vector<int> unmatched_tracks;
+        vector<int> unmatched;
 
-        // Build list of track ids
-        vector<int> track_ids;
-        for (auto& kv : tracks) track_ids.push_back(kv.first);
-        unmatched_tracks = track_ids;
+        for (auto& kv : tracks)
+            unmatched.push_back(kv.first);
 
-        // Greedy matching
-        for (size_t det_idx = 0; det_idx < detections.size(); ++det_idx) {
-            auto& det = detections[det_idx];
-            Point2f c = det.first;
-            Rect bbox = det.second;
+        for (size_t i = 0; i < detections.size(); ++i) {
 
-            int best_tid = -1;
+            Point2f c = detections[i].first;
+            Rect r = detections[i].second;
+
+            int best_id = -1;
             double best_dist = 1e9;
-            for (int tid : track_ids) {
-                if (find(unmatched_tracks.begin(), unmatched_tracks.end(), tid) == unmatched_tracks.end())
-                    continue;
+
+            for (int tid : unmatched) {
                 double d = dist(c, tracks[tid].centroid);
                 if (d < best_dist) {
                     best_dist = d;
-                    best_tid = tid;
+                    best_id = tid;
                 }
             }
 
-            if (best_tid != -1 && best_dist <= dist_threshold) {
-                Track& t = tracks[best_tid];
+            if (best_id != -1 && best_dist < DIST_THRESH) {
+
+                auto& t = tracks[best_id];
                 t.centroid = c;
-                t.bbox = bbox;
+                t.bbox = r;
                 t.history.push_back(c);
                 if (t.history.size() > 50) t.history.pop_front();
-                t.hits += 1;
+
+                t.hits++;
                 t.misses = 0;
-                if (t.hits >= confirm_hits) t.confirmed = true;
+                if (t.hits >= N_CONFIRM)
+                    t.confirmed = true;
 
-                unmatched_tracks.erase(remove(unmatched_tracks.begin(), unmatched_tracks.end(), best_tid), unmatched_tracks.end());
-                assigned.insert(det_idx);
+                unmatched.erase(remove(unmatched.begin(), unmatched.end(), best_id), unmatched.end());
+                assigned.insert(i);
             }
         }
 
-        // Unmatched detections -> new tracks
-        for (size_t det_idx = 0; det_idx < detections.size(); ++det_idx) {
-            if (assigned.count(det_idx)) continue;
-            auto& det = detections[det_idx];
-            tracks[next_id] = Track(next_id, det.first, det.second);
-            next_id++;
+        for (size_t i = 0; i < detections.size(); ++i) {
+            if (!assigned.count(i)) {
+                tracks[next_id] = Track(next_id, detections[i].first, detections[i].second);
+                next_id++;
+            }
         }
 
-        // Increase misses for unmatched tracks
-        for (int tid : unmatched_tracks) {
-            Track& t = tracks[tid];
-            t.misses += 1;
-            if (t.misses > max_misses) {
+        for (int tid : unmatched) {
+            tracks[tid].misses++;
+            if (tracks[tid].misses > MAX_MISSES)
                 tracks.erase(tid);
-            }
         }
     }
 
     vector<Track> get_tracks() {
-        vector<Track> res;
-        for (auto& kv : tracks) res.push_back(kv.second);
-        return res;
+        vector<Track> out;
+        for (auto& kv : tracks)
+            out.push_back(kv.second);
+        return out;
     }
 };
 
-// ---------------- Helper ----------------
-Mat upscale_frame(const Mat& frame, double scale) {
-    if (scale == 1.0) return frame;
-    Mat out;
-    resize(frame, out, Size(), scale, scale, INTER_LINEAR);
-    return out;
-}
-
-// ---------------- Main processing ----------------
+// ---------------- MAIN ----------------
 int main() {
-    
-    cout << "OpenCV threads: " << getNumThreads() << endl;
-    cout << "OpenCV build info:\n";
-    cout << getBuildInformation() << endl;
+    string qqq;
+    if (cuda::getCudaEnabledDeviceCount() == 0) {
+        cerr << "CUDA device not found!\n";
+        return -1;
+    }
 
-    setNumThreads(16);
+    cuda::setDevice(0);
 
-    double total_gray = 0;
-    double total_mog = 0;
-    double total_thresh = 0;
-    double total_open = 0;
-    double total_close = 0;
-    double total_contours = 0;
-    double total_tracker = 0;
-    double total_draw = 0;
-    double total_write = 0;
-
-    auto t_global_start = std::chrono::high_resolution_clock::now();
+    cout << "CUDA device count: "
+        << cuda::getCudaEnabledDeviceCount() << endl;
 
     VideoCapture cap(VIDEO_PATH);
-
     if (!cap.isOpened()) {
-        cerr << "Cannot open video: " << VIDEO_PATH << endl;
+        cerr << "Cannot open video\n";
         return -1;
     }
 
     double fps = cap.get(CAP_PROP_FPS);
     if (fps == 0) fps = 25.0;
 
-    int w = (int)cap.get(CAP_PROP_FRAME_WIDTH);
-    int h = (int)cap.get(CAP_PROP_FRAME_HEIGHT);
-    int w_s = (int)(w * UPSCALE);
-    int h_s = (int)(h * UPSCALE);
+    int w = cap.get(CAP_PROP_FRAME_WIDTH);
+    int h = cap.get(CAP_PROP_FRAME_HEIGHT);
 
-    VideoWriter writer(OUT_PATH, VideoWriter::fourcc('m', 'p', '4', 'v'), fps, Size(w_s, h_s));
+    //VideoWriter writer(OUT_PATH,
+    //    VideoWriter::fourcc('m', 'p', '4', 'v'),
+    //    fps, Size(w*UPSCALE, h*UPSCALE));
 
-    Ptr<BackgroundSubtractor> backSub = createBackgroundSubtractorMOG2(MOG_HISTORY, MOG_VAR_THRESHOLD, MOG_DETECT_SHADOWS);
+    ofstream csv_file(OUT_CSV);
+    csv_file << "frame,id,x,y,w,h,confirmed\n";
+
+    // CUDA objects
+    Ptr<cuda::BackgroundSubtractorMOG2> mog =
+        cuda::createBackgroundSubtractorMOG2(
+            MOG_HISTORY,
+            MOG_VAR_THRESHOLD,
+            MOG_DETECT_SHADOWS);
+
+    auto morphOpen = cuda::createMorphologyFilter(
+        MORPH_OPEN, CV_8UC1, KERNEL_OPEN);
+
+    auto morphClose = cuda::createMorphologyFilter(
+        MORPH_CLOSE, CV_8UC1, KERNEL_CLOSE);
 
     SimpleTracker tracker;
 
-    ofstream csv_file(OUT_CSV);
-    csv_file << "frame_idx,track_id,x,y,w,h,confirmed\n";
+    // Profiling
+    double total_upload = 0, total_gray = 0, total_mog = 0;
+    double total_thresh = 0, total_open = 0, total_close = 0;
+    double total_download = 0, total_contours = 0;
+    double total_tracker = 0, total_draw = 0, total_write = 0;
 
-    int frame_idx = 0;
+    auto global_start = chrono::high_resolution_clock::now();
+
     Mat frame;
+    int frame_idx = 0;
+
     while (cap.read(frame)) {
+        if (UPSCALE != 1.0) {
+            cv::resize(frame, frame, cv::Size(), UPSCALE, UPSCALE, cv::INTER_LINEAR);
+        }
+
         frame_idx++;
 
-        Mat frame_up = upscale_frame(frame, UPSCALE);
-        Mat gray;
+        cuda::GpuMat d_frame, d_gray, d_fgmask;
 
         auto t1 = chrono::high_resolution_clock::now();
-        cvtColor(frame_up, gray, COLOR_BGR2GRAY);
+        d_frame.upload(frame);
         auto t2 = chrono::high_resolution_clock::now();
+        total_upload += chrono::duration<double, milli>(t2 - t1).count();
+
+        t1 = chrono::high_resolution_clock::now();
+        cuda::cvtColor(d_frame, d_gray, COLOR_BGR2GRAY);
+        t2 = chrono::high_resolution_clock::now();
         total_gray += chrono::duration<double, milli>(t2 - t1).count();
 
-        Mat fgmask;
         t1 = chrono::high_resolution_clock::now();
-        backSub->apply(gray, fgmask);
+        mog->apply(d_gray, d_fgmask);
         t2 = chrono::high_resolution_clock::now();
         total_mog += chrono::duration<double, milli>(t2 - t1).count();
 
         t1 = chrono::high_resolution_clock::now();
-        threshold(fgmask, fgmask, 127, 255, THRESH_BINARY);
+        cuda::threshold(d_fgmask, d_fgmask, 127, 255, THRESH_BINARY);
         t2 = chrono::high_resolution_clock::now();
         total_thresh += chrono::duration<double, milli>(t2 - t1).count();
 
         t1 = chrono::high_resolution_clock::now();
-        morphologyEx(fgmask, fgmask, MORPH_OPEN, KERNEL_OPEN);
+        morphOpen->apply(d_fgmask, d_fgmask);
         t2 = chrono::high_resolution_clock::now();
         total_open += chrono::duration<double, milli>(t2 - t1).count();
 
         t1 = chrono::high_resolution_clock::now();
-        morphologyEx(fgmask, fgmask, MORPH_CLOSE, KERNEL_CLOSE);
+        morphClose->apply(d_fgmask, d_fgmask);
         t2 = chrono::high_resolution_clock::now();
         total_close += chrono::duration<double, milli>(t2 - t1).count();
 
+        Mat fgmask;
+        t1 = chrono::high_resolution_clock::now();
+        d_fgmask.download(fgmask);
+        t2 = chrono::high_resolution_clock::now();
+        total_download += chrono::duration<double, milli>(t2 - t1).count();
 
         vector<vector<Point>> contours;
         t1 = chrono::high_resolution_clock::now();
@@ -232,87 +243,83 @@ int main() {
         total_contours += chrono::duration<double, milli>(t2 - t1).count();
 
         vector<pair<Point2f, Rect>> detections;
-        for (auto& cnt : contours) {
-            double area = contourArea(cnt);
+        for (auto& c : contours) {
+            double area = contourArea(c);
             if (area < MIN_AREA || area > MAX_AREA) continue;
-            Rect r = boundingRect(cnt);
-            Point2f c(r.x + r.width / 2.0f, r.y + r.height / 2.0f);
-            detections.push_back(make_pair(c, r));
+            Rect r = boundingRect(c);
+            Point2f center(r.x + r.width / 2.0f,
+                r.y + r.height / 2.0f);
+            detections.push_back({ center,r });
         }
 
         t1 = chrono::high_resolution_clock::now();
         tracker.update(detections);
         t2 = chrono::high_resolution_clock::now();
         total_tracker += chrono::duration<double, milli>(t2 - t1).count();
-        
-        t1 = chrono::high_resolution_clock::now();
-        Mat vis = frame_up.clone();
+
+        /*t1 = chrono::high_resolution_clock::now();
+        Mat vis = frame.clone();
+
         for (auto& t : tracker.get_tracks()) {
-            Rect r = t.bbox;
-            Point2f c = t.centroid;
 
-            // draw track history
-            vector<Point2f> pts(t.history.begin(), t.history.end());
-            for (size_t i = 1; i < pts.size(); ++i) {
-                line(vis, pts[i - 1], pts[i], COLOR_TRACK, 1);
-            }
+            for (size_t i = 1; i < t.history.size(); ++i)
+                line(vis, t.history[i - 1], t.history[i], COLOR_TRACK, 1);
 
-            Scalar color = t.confirmed ? COLOR_CONFIRMED : COLOR_PENDING;
-            Rect r_clamped = r & Rect(0, 0, w_s, h_s);
-            rectangle(vis, r_clamped, color, 2);
-            putText(vis, "ID:" + to_string(t.id) + " H:" + to_string(t.hits) + " M:" + to_string(t.misses),
-                Point(r_clamped.x, max(0, r_clamped.y - 6)), FONT_HERSHEY_SIMPLEX, 0.4, color, 1);
+            Scalar col = t.confirmed ? COLOR_CONFIRMED : COLOR_PENDING;
+            rectangle(vis, t.bbox, col, 2);
 
-            csv_file << frame_idx << "," << t.id << "," << (int)c.x << "," << (int)c.y << ","
-                << r.width << "," << r.height << "," << (int)t.confirmed << "\n";
-        } 
-        t2 = chrono::high_resolution_clock::now();
-        total_draw += chrono::duration<double, milli>(t2 - t1).count();
+            putText(vis, "ID:" + to_string(t.id),
+                Point(t.bbox.x, t.bbox.y - 5),
+                FONT_HERSHEY_SIMPLEX, 0.4, col, 1);
 
-        t1 = chrono::high_resolution_clock::now();
-        writer.write(vis);
-        t2 = chrono::high_resolution_clock::now();
-        total_write += chrono::duration<double, milli>(t2 - t1).count();
-
-        if (frame_idx % 10 == 0) {
-            cout << "Frame " << frame_idx;
+            csv_file << frame_idx << ","
+                << t.id << ","
+                << t.centroid.x << ","
+                << t.centroid.y << ","
+                << t.bbox.width << ","
+                << t.bbox.height << ","
+                << t.confirmed << "\n";
         }
+
+        t2 = chrono::high_resolution_clock::now();
+        total_draw += chrono::duration<double, milli>(t2 - t1).count();*/
+
+        //t1 = chrono::high_resolution_clock::now();
+        //writer.write(vis);
+        //t2 = chrono::high_resolution_clock::now();
+        //total_write += chrono::duration<double, milli>(t2 - t1).count();
+
+        if (frame_idx % 10 == 0)
+            cout << "Frame " << frame_idx << endl;
     }
 
-    csv_file.close();
+    auto global_end = chrono::high_resolution_clock::now();
+    double total_sec =
+        chrono::duration<double>(global_end - global_start).count();
+
+    cout << "\n================ CUDA PROFILING ================\n";
+    cout << "Total time: " << total_sec << " sec\n";
+    cout << "Avg time per frame: "
+        << total_sec / frame_idx << " sec/frame\n";
+
+    cout << "\n--- Avg per frame (ms) ---\n";
+    cout << "Upload:     " << total_upload / frame_idx << endl;
+    cout << "Gray:       " << total_gray / frame_idx << endl;
+    cout << "MOG2:       " << total_mog / frame_idx << endl;
+    cout << "Threshold:  " << total_thresh / frame_idx << endl;
+    cout << "MorphOpen:  " << total_open / frame_idx << endl;
+    cout << "MorphClose: " << total_close / frame_idx << endl;
+    cout << "Download:   " << total_download / frame_idx << endl;
+    cout << "Contours:   " << total_contours / frame_idx << endl;
+    cout << "Tracker:    " << total_tracker / frame_idx << endl;
+    cout << "Draw:       " << total_draw / frame_idx << endl;
+    cout << "Writer:     " << total_write / frame_idx << endl;
+
     cap.release();
-    writer.release();
-    cout << "Done. Output: " << OUT_PATH << " CSV: " << OUT_CSV << endl;
+    //writer.release();
+    csv_file.close();
 
-    auto t_global_end = std::chrono::high_resolution_clock::now();
-    double total_sec = std::chrono::duration<double>(t_global_end - t_global_start).count();
-
-    cout << "\n=====================================\n";
-    cout << "Total processing time: " << total_sec << " sec\n";
-    cout << "Avg time per frame: " << (total_sec / frame_idx) << " sec/frame\n";
-    cout << "=====================================\n";
-
-    cout << "\n=== Detailed timing (ms total) ===\n";
-    cout << "Gray:        " << total_gray << endl;
-    cout << "MOG2:        " << total_mog << endl;
-    cout << "Threshold:   " << total_thresh << endl;
-    cout << "Morph OPEN:  " << total_open << endl;
-    cout << "Morph CLOSE: " << total_close << endl;
-    cout << "Contours:    " << total_contours << endl;
-    cout << "Tracker:     " << total_tracker << endl;
-    cout << "Drawing:     " << total_draw << endl;
-    cout << "Writer:      " << total_write << endl;
-
-    cout << "\n=== Avg per frame (ms) ===\n";
-    cout << "Gray:        " << total_gray / frame_idx << endl;
-    cout << "MOG2:        " << total_mog / frame_idx << endl;
-    cout << "Threshold:   " << total_thresh / frame_idx << endl;
-    cout << "Morph OPEN:  " << total_open / frame_idx << endl;
-    cout << "Morph CLOSE: " << total_close / frame_idx << endl;
-    cout << "Contours:    " << total_contours / frame_idx << endl;
-    cout << "Tracker:     " << total_tracker / frame_idx << endl;
-    cout << "Drawing:     " << total_draw / frame_idx << endl;
-    cout << "Writer:      " << total_write / frame_idx << endl;
+    cin >> qqq;
 
     return 0;
 }
