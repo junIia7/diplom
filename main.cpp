@@ -1,9 +1,4 @@
 #include <opencv2/opencv.hpp>
-#include <opencv2/cudaarithm.hpp>
-#include <opencv2/cudabgsegm.hpp>
-#include <opencv2/cudafilters.hpp>
-#include <opencv2/cudaimgproc.hpp>
-
 #include <iostream>
 #include <fstream>
 #include <deque>
@@ -15,9 +10,9 @@ using namespace cv;
 using namespace std;
 
 // ---------------- Parameters ----------------
-const string VIDEO_PATH = "./video.mp4";
-const string OUT_PATH = "./output_cuda.mp4";
-const string OUT_CSV = "./detections_cuda.csv";
+const string VIDEO_PATH = "./input.mp4";
+const string OUT_PATH = "./output_cpu.mp4";
+const string OUT_CSV = "./detections_cpu.csv";
 
 const int MOG_HISTORY = 30;
 const double MOG_VAR_THRESHOLD = 25;
@@ -31,7 +26,7 @@ const double DIST_THRESH = 60.0;
 
 const double UPSCALE = 4.0;
 
-// Morphology kernels (CPU создаём, CUDA использует их внутри фильтра)
+// Morphology kernels
 Mat KERNEL_OPEN = getStructuringElement(MORPH_ELLIPSE, Size(5, 5));
 Mat KERNEL_CLOSE = getStructuringElement(MORPH_ELLIPSE, Size(9, 9));
 
@@ -135,16 +130,10 @@ public:
 
 // ---------------- MAIN ----------------
 int main() {
-    string qqq;
-    if (cuda::getCudaEnabledDeviceCount() == 0) {
-        cerr << "CUDA device not found!\n";
-        return -1;
-    }
 
-    cuda::setDevice(0);
-
-    cout << "CUDA device count: "
-        << cuda::getCudaEnabledDeviceCount() << endl;
+    // --- Ограничение до 1 ядра (для теста) ---
+    setNumThreads(1);  // раскомментировать для однопоточной версии
+    // setNumThreads(0);  // использовать все доступные ядра (по умолчанию)
 
     VideoCapture cap(VIDEO_PATH);
     if (!cap.isOpened()) {
@@ -165,26 +154,19 @@ int main() {
     ofstream csv_file(OUT_CSV);
     csv_file << "frame,id,x,y,w,h,confirmed\n";
 
-    // CUDA objects
-    Ptr<cuda::BackgroundSubtractorMOG2> mog =
-        cuda::createBackgroundSubtractorMOG2(
+    // CPU MOG2
+    Ptr<BackgroundSubtractorMOG2> mog =
+        createBackgroundSubtractorMOG2(
             MOG_HISTORY,
             MOG_VAR_THRESHOLD,
             MOG_DETECT_SHADOWS);
 
-    auto morphOpen = cuda::createMorphologyFilter(
-        MORPH_OPEN, CV_8UC1, KERNEL_OPEN);
-
-    auto morphClose = cuda::createMorphologyFilter(
-        MORPH_CLOSE, CV_8UC1, KERNEL_CLOSE);
-
     SimpleTracker tracker;
 
     // Profiling
-    double total_upload = 0, total_gray = 0, total_mog = 0;
+    double total_gray = 0, total_mog = 0;
     double total_thresh = 0, total_open = 0, total_close = 0;
-    double total_download = 0, total_contours = 0;
-    double total_tracker = 0, total_draw = 0, total_write = 0;
+    double total_contours = 0, total_tracker = 0, total_draw = 0;
 
     auto global_start = chrono::high_resolution_clock::now();
 
@@ -193,48 +175,37 @@ int main() {
 
     while (cap.read(frame)) {
         if (UPSCALE != 1.0) {
-            cv::resize(frame, frame, cv::Size(), UPSCALE, UPSCALE, cv::INTER_LINEAR);
+            cv::resize(frame, frame, Size(), UPSCALE, UPSCALE, INTER_LINEAR);
         }
 
         frame_idx++;
 
-        cuda::GpuMat d_frame, d_gray, d_fgmask;
+        Mat gray, fgmask;
 
         auto t1 = chrono::high_resolution_clock::now();
-        d_frame.upload(frame);
+        cvtColor(frame, gray, COLOR_BGR2GRAY);
         auto t2 = chrono::high_resolution_clock::now();
-        total_upload += chrono::duration<double, milli>(t2 - t1).count();
-
-        t1 = chrono::high_resolution_clock::now();
-        cuda::cvtColor(d_frame, d_gray, COLOR_BGR2GRAY);
-        t2 = chrono::high_resolution_clock::now();
         total_gray += chrono::duration<double, milli>(t2 - t1).count();
 
         t1 = chrono::high_resolution_clock::now();
-        mog->apply(d_gray, d_fgmask);
+        mog->apply(gray, fgmask);
         t2 = chrono::high_resolution_clock::now();
         total_mog += chrono::duration<double, milli>(t2 - t1).count();
 
         t1 = chrono::high_resolution_clock::now();
-        cuda::threshold(d_fgmask, d_fgmask, 127, 255, THRESH_BINARY);
+        threshold(fgmask, fgmask, 127, 255, THRESH_BINARY);
         t2 = chrono::high_resolution_clock::now();
         total_thresh += chrono::duration<double, milli>(t2 - t1).count();
 
         t1 = chrono::high_resolution_clock::now();
-        morphOpen->apply(d_fgmask, d_fgmask);
+        morphologyEx(fgmask, fgmask, MORPH_OPEN, KERNEL_OPEN);
         t2 = chrono::high_resolution_clock::now();
         total_open += chrono::duration<double, milli>(t2 - t1).count();
 
         t1 = chrono::high_resolution_clock::now();
-        morphClose->apply(d_fgmask, d_fgmask);
+        morphologyEx(fgmask, fgmask, MORPH_CLOSE, KERNEL_CLOSE);
         t2 = chrono::high_resolution_clock::now();
         total_close += chrono::duration<double, milli>(t2 - t1).count();
-
-        Mat fgmask;
-        t1 = chrono::high_resolution_clock::now();
-        d_fgmask.download(fgmask);
-        t2 = chrono::high_resolution_clock::now();
-        total_download += chrono::duration<double, milli>(t2 - t1).count();
 
         vector<vector<Point>> contours;
         t1 = chrono::high_resolution_clock::now();
@@ -257,7 +228,8 @@ int main() {
         t2 = chrono::high_resolution_clock::now();
         total_tracker += chrono::duration<double, milli>(t2 - t1).count();
 
-        /*t1 = chrono::high_resolution_clock::now();
+        /* --- Для отладки и сохранения ---
+        t1 = chrono::high_resolution_clock::now();
         Mat vis = frame.clone();
 
         for (auto& t : tracker.get_tracks()) {
@@ -273,21 +245,19 @@ int main() {
                 FONT_HERSHEY_SIMPLEX, 0.4, col, 1);
 
             csv_file << frame_idx << ","
-                << t.id << ","
-                << t.centroid.x << ","
-                << t.centroid.y << ","
-                << t.bbox.width << ","
-                << t.bbox.height << ","
-                << t.confirmed << "\n";
+                     << t.id << ","
+                     << t.centroid.x << ","
+                     << t.centroid.y << ","
+                     << t.bbox.width << ","
+                     << t.bbox.height << ","
+                     << t.confirmed << "\n";
         }
 
         t2 = chrono::high_resolution_clock::now();
-        total_draw += chrono::duration<double, milli>(t2 - t1).count();*/
+        total_draw += chrono::duration<double, milli>(t2 - t1).count();
 
-        //t1 = chrono::high_resolution_clock::now();
         //writer.write(vis);
-        //t2 = chrono::high_resolution_clock::now();
-        //total_write += chrono::duration<double, milli>(t2 - t1).count();
+        */
 
         if (frame_idx % 10 == 0)
             cout << "Frame " << frame_idx << endl;
@@ -297,29 +267,24 @@ int main() {
     double total_sec =
         chrono::duration<double>(global_end - global_start).count();
 
-    cout << "\n================ CUDA PROFILING ================\n";
+    cout << "\n================ CPU PROFILING ================\n";
     cout << "Total time: " << total_sec << " sec\n";
     cout << "Avg time per frame: "
         << total_sec / frame_idx << " sec/frame\n";
 
     cout << "\n--- Avg per frame (ms) ---\n";
-    cout << "Upload:     " << total_upload / frame_idx << endl;
     cout << "Gray:       " << total_gray / frame_idx << endl;
     cout << "MOG2:       " << total_mog / frame_idx << endl;
     cout << "Threshold:  " << total_thresh / frame_idx << endl;
     cout << "MorphOpen:  " << total_open / frame_idx << endl;
     cout << "MorphClose: " << total_close / frame_idx << endl;
-    cout << "Download:   " << total_download / frame_idx << endl;
     cout << "Contours:   " << total_contours / frame_idx << endl;
     cout << "Tracker:    " << total_tracker / frame_idx << endl;
     cout << "Draw:       " << total_draw / frame_idx << endl;
-    cout << "Writer:     " << total_write / frame_idx << endl;
 
     cap.release();
     //writer.release();
     csv_file.close();
-
-    cin >> qqq;
 
     return 0;
 }
